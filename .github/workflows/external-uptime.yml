@@ -1,207 +1,131 @@
-# External uptime check for serbanserver.
+# External uptime check for serbanserver - dead-man's switch.
 #
-# WHY THIS EXISTS: Uptime Kuma runs *on* the server it watches, so it can report
-# a container dying but can never report the box itself being gone - power cut,
-# router dead, ISP down, drive failure. This runs on GitHub's infrastructure,
-# outside the house, and is the only thing that can catch total loss.
+# WHY THIS SHAPE: the obvious design (probe the public URLs from here) does not
+# work. Cloudflare's free Bot Fight Mode returns 403 to datacenter IPs, and a
+# GitHub runner is one - verified 2026-08-18, all three endpoints returned 403
+# to the runner while returning 200/200/302 from the owner's home IP. Per
+# Cloudflare's docs, Bot Fight Mode "does not run on the Ruleset Engine", so no
+# WAF Skip rule can whitelist a prober; the only inbound fixes are disabling bot
+# protection or paying for Super Bot Fight Mode.
 #
-# It deliberately probes only the PUBLIC endpoints. Nextcloud, Immich, Jellyfin
-# and Umami are Tailscale-only and are already covered by Uptime Kuma.
+# So the direction is inverted. serbanserver force-pushes a timestamp to the
+# "heartbeat" branch every 10 minutes (/usr/local/sbin/uptime-heartbeat.sh, via
+# uptime-heartbeat.timer). This job just checks how old that timestamp is.
+# Outbound traffic never meets inbound bot protection, so nothing had to be
+# weakened to make monitoring work.
 #
-# Cloudflare serves all three of these with cf-cache-status: DYNAMIC (verified
-# 2026-08-18), so every probe reaches the origin - a green result here really
-# does mean the server answered, not that a cached copy was replayed.
+# WHAT THIS CATCHES: total loss - power, network, ISP, drive, kernel panic.
+# WHAT IT DOES NOT: anything while the box is alive. Uptime Kuma covers that,
+# including public reachability, since it probes the site through Cloudflare
+# and so notices a dead tunnel.
 #
-# ---------------------------------------------------------------------------
-# PUT THIS IN A **PUBLIC** REPO. Scheduled Actions are free and unmetered on
-# public repos. On a private repo every run bills against the 2000 free
-# minutes/month, and this schedule alone (2880 runs) would blow through that.
-# If you insist on private, change the cron to '*/30 * * * *' and it fits.
-# The file contains nothing secret - just two domain names that are already
-# public DNS records.
-# ---------------------------------------------------------------------------
+# Keep this repo PUBLIC: scheduled Actions are unmetered on public repos, and
+# this job needs no secrets to read a public branch.
 
 name: External uptime check
 
 on:
   schedule:
-    # Every 15 minutes. GitHub's scheduler is best-effort and can run late
-    # under load, so treat this as "detect an outage within ~30 min", not as
-    # second-by-second monitoring. Uptime Kuma remains the fast, fine-grained
-    # monitor for everything that is not a total-loss event.
+    # Every 15 minutes. GitHub's scheduler is best-effort and runs late under
+    # load, which is fine: staleness is measured from the timestamp in the
+    # branch, not from when this job happens to run.
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+# Read-only. The old design needed write access for an anti-hibernation commit;
+# the server's own heartbeat pushes are now the repository activity that keeps
+# GitHub from disabling this schedule after 60 days.
 permissions:
-  contents: write   # needed only for the anti-hibernation heartbeat commit
+  contents: read
 
 concurrency:
   group: external-uptime
   cancel-in-progress: false
 
 jobs:
-  probe:
+  heartbeat:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
-      # Declared at JOB level on purpose. A step's own `env:` block is not
-      # visible to that step's `if:` condition, so putting this on the ntfy
-      # step would make its guard always evaluate empty - and the alert would
-      # silently never fire.
+      # Declared at JOB level on purpose: a step's own env: block is not visible
+      # to that step's if: condition, so a step-level declaration would make the
+      # guard below always evaluate empty and the alert would never fire.
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      # Server beats every 10 minutes; alert after ~3 consecutive misses so a
+      # single blip or a slow scheduler does not page anyone.
+      MAX_AGE_SECONDS: '2100'
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Fetch the heartbeat branch
+        uses: actions/checkout@v4
+        with:
+          ref: heartbeat
+          fetch-depth: 1
 
-      - name: Probe public endpoints
-        id: probe
+      - name: Check heartbeat freshness
+        id: check
         run: |
           set -uo pipefail
 
-          # url|expected status
-          TARGETS=(
-            "https://serban-photo.com|200"
-            "https://serban-photo.com/admin/login|200"
-            "https://galleries.serban-photo.com|302"
-          )
-
-          ATTEMPTS=3
-          failures=()
-          report=""
-
-          for entry in "${TARGETS[@]}"; do
-            url="${entry%%|*}"
-            want="${entry##*|}"
-            got=""
-            ok=0
-
-            # Retry before declaring anything down. A single failed probe is far
-            # more likely to be a flaky GitHub runner than a dead server, and a
-            # monitor that cries wolf gets ignored - which is worse than none.
-            for i in $(seq 1 $ATTEMPTS); do
-              # NOTE: on DNS/connect failure curl still prints '000' via -w and
-              # THEN exits non-zero. A '|| echo 000' fallback here would append a
-              # second '000', yielding '000000' and breaking the case match below.
-              got=$(curl -s -o /dev/null -w '%{http_code}' \
-                       --max-time 20 "$url" 2>/dev/null)
-              [ -n "$got" ] || got="000"
-              if [ "$got" = "$want" ]; then ok=1; break; fi
-              [ "$i" -lt "$ATTEMPTS" ] && sleep 10
-            done
-
-            if [ "$ok" = 1 ]; then
-              report+="OK   $url -> $got"$'\n'
-            else
-              # 520-527 are Cloudflare's "origin unreachable" family: strong
-              # evidence the box itself is gone rather than the app misbehaving.
-              hint=""
-              case "$got" in
-                52[0-7]) hint=" (Cloudflare cannot reach origin - server likely down)" ;;
-                000)     hint=" (no response at all)" ;;
-              esac
-              report+="DOWN $url -> got '$got', expected '$want'$hint"$'\n'
-              failures+=("$url ($got)")
-            fi
-          done
-
-          echo "$report"
-          {
-            echo "report<<REPORT_EOF"
-            echo "$report"
-            echo "REPORT_EOF"
-            echo "failed_count=${#failures[@]}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Push alert to ntfy.sh
-        # Only fires on failure, and only if you've set the NTFY_TOPIC secret.
-        # Your self-hosted ntfy is Tailscale-only and unreachable from here, so
-        # this uses public ntfy.sh with a topic only you know. Pick something
-        # long and random - a public ntfy.sh topic is readable by anyone who
-        # guesses the name. Subscribe your phone to that same topic.
-        if: steps.probe.outputs.failed_count != '0' && env.NTFY_TOPIC != ''
-        env:
-          REPORT: ${{ steps.probe.outputs.report }}
-        run: |
-          curl -s -m 15 \
-            -H "Title: serbanserver UNREACHABLE from outside" \
-            -H "Priority: urgent" \
-            -H "Tags: rotating_light" \
-            --data-binary "$REPORT" \
-            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
-
-      - name: Record failure detail
-        # Commit the probe report when something fails, so the diagnosis is
-        # readable over plain git without needing the GitHub API or web UI.
-        # Failures should be rare, so this does not spam the history.
-        if: steps.probe.outputs.failed_count != '0'
-        env:
-          # Pass through env, never interpolate ${{ }} straight into the shell:
-          # the report contains quotes and URLs and would be a script-injection
-          # hazard as well as a quoting minefield.
-          REPORT: ${{ steps.probe.outputs.report }}
-        run: |
-          set -uo pipefail
-          mkdir -p .uptime
-          # Deliberately NO timestamp in the file. This runs every 15 minutes,
-          # and if the content changed every run a sustained outage would commit
-          # ~96 times a day. Identical failures now produce no commit at all;
-          # the run id and time live in the commit message instead.
-          printf '%s\n' "$REPORT" > .uptime/last-failure.txt
-          git config user.name  "uptime-bot"
-          git config user.email "uptime-bot@users.noreply.github.com"
-          git add .uptime/last-failure.txt
-          if git diff --staged --quiet; then
-            echo "same failure as last time - no commit"
-          else
-            git commit -q -m "record probe failure (run ${GITHUB_RUN_ID:-?} at $(date -u +%Y-%m-%dT%H:%M:%SZ)) [skip ci]"
-            git push || echo "::warning::could not push failure detail"
-          fi
-
-      - name: Weekly heartbeat commit
-        # GitHub disables scheduled workflows after 60 days of repository
-        # inactivity. A monitoring repo has no other commits, so without this
-        # the monitor would silently switch itself off - exactly the failure
-        # mode this whole exercise exists to prevent.
-        #
-        # Committing on every run would bury the repo in ~35k commits a year,
-        # so this only writes when the stored stamp is more than 7 days old.
-        if: always()
-        run: |
-          set -uo pipefail
-          mkdir -p .uptime
-          stamp_file=.uptime/last-heartbeat
-          now=$(date -u +%s)
-          old=0
-          [ -f "$stamp_file" ] && old=$(cat "$stamp_file" 2>/dev/null || echo 0)
-          [[ "$old" =~ ^[0-9]+$ ]] || old=0
-
-          if [ $(( now - old )) -lt 604800 ]; then
-            echo "heartbeat is recent ($(( (now - old) / 86400 ))d old) - no commit needed"
+          if [ ! -f beat ]; then
+            echo "::error::heartbeat branch has no 'beat' file"
+            echo "stale=1" >> "$GITHUB_OUTPUT"
+            echo "detail=heartbeat branch is missing its beat file" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "$now" > "$stamp_file"
-          date -u +%Y-%m-%dT%H:%M:%SZ > .uptime/last-heartbeat-human
-          git config user.name  "uptime-bot"
-          git config user.email "uptime-bot@users.noreply.github.com"
-          git add .uptime/
-          git diff --staged --quiet || git commit -m "uptime heartbeat [skip ci]"
-
-          # Do NOT fail the job on a push error - that would raise a false
-          # "server down" alert. But do NOT swallow it either: if this push
-          # keeps failing, the 60-day hibernation protection is gone and the
-          # monitor will quietly switch itself off. Surface it loudly instead.
-          if ! git push; then
-            echo "::warning::Heartbeat push FAILED. Check Settings > Actions > General > Workflow permissions is set to 'Read and write permissions'. Until this succeeds, GitHub will disable this schedule after 60 days of inactivity."
+          # Strip anything non-numeric rather than trusting the file blindly.
+          beat="$(tr -dc '0-9' < beat)"
+          if [ -z "$beat" ]; then
+            echo "::error::beat file is empty or non-numeric"
+            echo "stale=1" >> "$GITHUB_OUTPUT"
+            echo "detail=beat file empty or non-numeric" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: Fail the run if anything was down
-        # A failed run is what triggers GitHub's own email to you, so this is
-        # the baseline alert channel even with no ntfy topic configured.
-        if: steps.probe.outputs.failed_count != '0'
+          human="$(cat beat.human 2>/dev/null || echo 'unknown')"
+          now="$(date -u +%s)"
+          age=$(( now - beat ))
+
+          # Negative age means the server clock is ahead of GitHub's. That is a
+          # clock problem, not an outage - do not page for it.
+          if [ "$age" -lt 0 ]; then
+            echo "::warning::server clock appears ahead of GitHub by $(( -age ))s"
+            age=0
+          fi
+
+          echo "last beat : $human"
+          echo "age       : ${age}s (limit ${MAX_AGE_SECONDS}s)"
+
+          if [ "$age" -gt "$MAX_AGE_SECONDS" ]; then
+            mins=$(( age / 60 ))
+            echo "stale=1" >> "$GITHUB_OUTPUT"
+            echo "detail=No heartbeat from serbanserver for ${mins} minutes (last beat ${human} UTC, limit $(( MAX_AGE_SECONDS / 60 ))m). The server is likely off, offline, or has lost power." >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=0" >> "$GITHUB_OUTPUT"
+            echo "heartbeat healthy"
+          fi
+
+      - name: Push alert to ntfy.sh
+        # Your self-hosted ntfy is Tailscale-only and unreachable from GitHub,
+        # so this uses public ntfy.sh with a topic only you know.
+        if: steps.check.outputs.stale == '1' && env.NTFY_TOPIC != ''
         env:
-          REPORT: ${{ steps.probe.outputs.report }}
-          FAILED: ${{ steps.probe.outputs.failed_count }}
+          DETAIL: ${{ steps.check.outputs.detail }}
         run: |
-          echo "::error::${FAILED} endpoint(s) unreachable"
-          printf '%s\n' "$REPORT"
+          curl -s -m 15 \
+            -H "Title: serbanserver may be DOWN" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light" \
+            --data-binary "$DETAIL" \
+            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+
+      - name: Fail if the heartbeat is stale
+        # A failed run is what triggers GitHub's own email, so this remains the
+        # baseline alert channel even with no ntfy topic configured.
+        if: steps.check.outputs.stale == '1'
+        env:
+          DETAIL: ${{ steps.check.outputs.detail }}
+        run: |
+          echo "::error::${DETAIL}"
           exit 1

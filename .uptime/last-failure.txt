@@ -1,4 +1,0 @@
-DOWN https://serban-photo.com -> got '403', expected '200'
-DOWN https://serban-photo.com/admin/login -> got '403', expected '200'
-DOWN https://galleries.serban-photo.com -> got '403', expected '302'
-
