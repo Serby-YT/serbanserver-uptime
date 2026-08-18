@@ -43,6 +43,12 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Declared at JOB level on purpose. A step's own `env:` block is not
+      # visible to that step's `if:` condition, so putting this on the ntfy
+      # step would make its guard always evaluate empty - and the alert would
+      # silently never fire.
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - uses: actions/checkout@v4
 
@@ -113,14 +119,42 @@ jobs:
         # guesses the name. Subscribe your phone to that same topic.
         if: steps.probe.outputs.failed_count != '0' && env.NTFY_TOPIC != ''
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          REPORT: ${{ steps.probe.outputs.report }}
         run: |
           curl -s -m 15 \
             -H "Title: serbanserver UNREACHABLE from outside" \
             -H "Priority: urgent" \
             -H "Tags: rotating_light" \
-            -d "${{ steps.probe.outputs.report }}" \
+            --data-binary "$REPORT" \
             "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+
+      - name: Record failure detail
+        # Commit the probe report when something fails, so the diagnosis is
+        # readable over plain git without needing the GitHub API or web UI.
+        # Failures should be rare, so this does not spam the history.
+        if: steps.probe.outputs.failed_count != '0'
+        env:
+          # Pass through env, never interpolate ${{ }} straight into the shell:
+          # the report contains quotes and URLs and would be a script-injection
+          # hazard as well as a quoting minefield.
+          REPORT: ${{ steps.probe.outputs.report }}
+        run: |
+          set -uo pipefail
+          mkdir -p .uptime
+          # Deliberately NO timestamp in the file. This runs every 15 minutes,
+          # and if the content changed every run a sustained outage would commit
+          # ~96 times a day. Identical failures now produce no commit at all;
+          # the run id and time live in the commit message instead.
+          printf '%s\n' "$REPORT" > .uptime/last-failure.txt
+          git config user.name  "uptime-bot"
+          git config user.email "uptime-bot@users.noreply.github.com"
+          git add .uptime/last-failure.txt
+          if git diff --staged --quiet; then
+            echo "same failure as last time - no commit"
+          else
+            git commit -q -m "record probe failure (run ${GITHUB_RUN_ID:-?} at $(date -u +%Y-%m-%dT%H:%M:%SZ)) [skip ci]"
+            git push || echo "::warning::could not push failure detail"
+          fi
 
       - name: Weekly heartbeat commit
         # GitHub disables scheduled workflows after 60 days of repository
@@ -164,7 +198,10 @@ jobs:
         # A failed run is what triggers GitHub's own email to you, so this is
         # the baseline alert channel even with no ntfy topic configured.
         if: steps.probe.outputs.failed_count != '0'
+        env:
+          REPORT: ${{ steps.probe.outputs.report }}
+          FAILED: ${{ steps.probe.outputs.failed_count }}
         run: |
-          echo "::error::${{ steps.probe.outputs.failed_count }} endpoint(s) unreachable"
-          echo "${{ steps.probe.outputs.report }}"
+          echo "::error::${FAILED} endpoint(s) unreachable"
+          printf '%s\n' "$REPORT"
           exit 1
