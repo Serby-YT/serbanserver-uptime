@@ -1,0 +1,170 @@
+# External uptime check for serbanserver.
+#
+# WHY THIS EXISTS: Uptime Kuma runs *on* the server it watches, so it can report
+# a container dying but can never report the box itself being gone - power cut,
+# router dead, ISP down, drive failure. This runs on GitHub's infrastructure,
+# outside the house, and is the only thing that can catch total loss.
+#
+# It deliberately probes only the PUBLIC endpoints. Nextcloud, Immich, Jellyfin
+# and Umami are Tailscale-only and are already covered by Uptime Kuma.
+#
+# Cloudflare serves all three of these with cf-cache-status: DYNAMIC (verified
+# 2026-08-18), so every probe reaches the origin - a green result here really
+# does mean the server answered, not that a cached copy was replayed.
+#
+# ---------------------------------------------------------------------------
+# PUT THIS IN A **PUBLIC** REPO. Scheduled Actions are free and unmetered on
+# public repos. On a private repo every run bills against the 2000 free
+# minutes/month, and this schedule alone (2880 runs) would blow through that.
+# If you insist on private, change the cron to '*/30 * * * *' and it fits.
+# The file contains nothing secret - just two domain names that are already
+# public DNS records.
+# ---------------------------------------------------------------------------
+
+name: External uptime check
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub's scheduler is best-effort and can run late
+    # under load, so treat this as "detect an outage within ~30 min", not as
+    # second-by-second monitoring. Uptime Kuma remains the fast, fine-grained
+    # monitor for everything that is not a total-loss event.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only for the anti-hibernation heartbeat commit
+
+concurrency:
+  group: external-uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe public endpoints
+        id: probe
+        run: |
+          set -uo pipefail
+
+          # url|expected status
+          TARGETS=(
+            "https://serban-photo.com|200"
+            "https://serban-photo.com/admin/login|200"
+            "https://galleries.serban-photo.com|302"
+          )
+
+          ATTEMPTS=3
+          failures=()
+          report=""
+
+          for entry in "${TARGETS[@]}"; do
+            url="${entry%%|*}"
+            want="${entry##*|}"
+            got=""
+            ok=0
+
+            # Retry before declaring anything down. A single failed probe is far
+            # more likely to be a flaky GitHub runner than a dead server, and a
+            # monitor that cries wolf gets ignored - which is worse than none.
+            for i in $(seq 1 $ATTEMPTS); do
+              # NOTE: on DNS/connect failure curl still prints '000' via -w and
+              # THEN exits non-zero. A '|| echo 000' fallback here would append a
+              # second '000', yielding '000000' and breaking the case match below.
+              got=$(curl -s -o /dev/null -w '%{http_code}' \
+                       --max-time 20 "$url" 2>/dev/null)
+              [ -n "$got" ] || got="000"
+              if [ "$got" = "$want" ]; then ok=1; break; fi
+              [ "$i" -lt "$ATTEMPTS" ] && sleep 10
+            done
+
+            if [ "$ok" = 1 ]; then
+              report+="OK   $url -> $got"$'\n'
+            else
+              # 520-527 are Cloudflare's "origin unreachable" family: strong
+              # evidence the box itself is gone rather than the app misbehaving.
+              hint=""
+              case "$got" in
+                52[0-7]) hint=" (Cloudflare cannot reach origin - server likely down)" ;;
+                000)     hint=" (no response at all)" ;;
+              esac
+              report+="DOWN $url -> got '$got', expected '$want'$hint"$'\n'
+              failures+=("$url ($got)")
+            fi
+          done
+
+          echo "$report"
+          {
+            echo "report<<REPORT_EOF"
+            echo "$report"
+            echo "REPORT_EOF"
+            echo "failed_count=${#failures[@]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push alert to ntfy.sh
+        # Only fires on failure, and only if you've set the NTFY_TOPIC secret.
+        # Your self-hosted ntfy is Tailscale-only and unreachable from here, so
+        # this uses public ntfy.sh with a topic only you know. Pick something
+        # long and random - a public ntfy.sh topic is readable by anyone who
+        # guesses the name. Subscribe your phone to that same topic.
+        if: steps.probe.outputs.failed_count != '0' && env.NTFY_TOPIC != ''
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl -s -m 15 \
+            -H "Title: serbanserver UNREACHABLE from outside" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light" \
+            -d "${{ steps.probe.outputs.report }}" \
+            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+
+      - name: Weekly heartbeat commit
+        # GitHub disables scheduled workflows after 60 days of repository
+        # inactivity. A monitoring repo has no other commits, so without this
+        # the monitor would silently switch itself off - exactly the failure
+        # mode this whole exercise exists to prevent.
+        #
+        # Committing on every run would bury the repo in ~35k commits a year,
+        # so this only writes when the stored stamp is more than 7 days old.
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p .uptime
+          stamp_file=.uptime/last-heartbeat
+          now=$(date -u +%s)
+          old=0
+          [ -f "$stamp_file" ] && old=$(cat "$stamp_file" 2>/dev/null || echo 0)
+          [[ "$old" =~ ^[0-9]+$ ]] || old=0
+
+          if [ $(( now - old )) -lt 604800 ]; then
+            echo "heartbeat is recent ($(( (now - old) / 86400 ))d old) - no commit needed"
+            exit 0
+          fi
+
+          echo "$now" > "$stamp_file"
+          date -u +%Y-%m-%dT%H:%M:%SZ > .uptime/last-heartbeat-human
+          git config user.name  "uptime-bot"
+          git config user.email "uptime-bot@users.noreply.github.com"
+          git add .uptime/
+          git diff --staged --quiet || git commit -m "uptime heartbeat [skip ci]"
+
+          # Do NOT fail the job on a push error - that would raise a false
+          # "server down" alert. But do NOT swallow it either: if this push
+          # keeps failing, the 60-day hibernation protection is gone and the
+          # monitor will quietly switch itself off. Surface it loudly instead.
+          if ! git push; then
+            echo "::warning::Heartbeat push FAILED. Check Settings > Actions > General > Workflow permissions is set to 'Read and write permissions'. Until this succeeds, GitHub will disable this schedule after 60 days of inactivity."
+          fi
+
+      - name: Fail the run if anything was down
+        # A failed run is what triggers GitHub's own email to you, so this is
+        # the baseline alert channel even with no ntfy topic configured.
+        if: steps.probe.outputs.failed_count != '0'
+        run: |
+          echo "::error::${{ steps.probe.outputs.failed_count }} endpoint(s) unreachable"
+          echo "${{ steps.probe.outputs.report }}"
+          exit 1
